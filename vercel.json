@@ -1,0 +1,13 @@
+{
+  "framework": null,
+  "buildCommand": null,
+  "outputDirectory": ".",
+  "functions": {
+    "api/caption.js": {
+      "maxDuration": 20
+    },
+    "api/config.js": {
+      "maxDuration": 10
+    }
+  }
+}
