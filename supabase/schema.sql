@@ -119,26 +119,69 @@ grant insert, update, delete on public.products to authenticated;
 
 -- ---------- STORAGE ----------
 -- Create the "product-images" bucket if it doesn't already exist, and make it public-read.
-insert into storage.buckets (id, name, public)
-values ('product-images', 'product-images', true)
-on conflict (id) do update set public = true;
+-- file_size_limit and allowed_mime_types are enforced by Supabase itself at
+-- upload time — a request exceeding either is rejected before it ever
+-- reaches your policies below, regardless of what the client claims.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('product-images', 'product-images', true, 8388608, array['image/jpeg','image/png','image/webp'])
+on conflict (id) do update set
+  public = true,
+  file_size_limit = 8388608,
+  allowed_mime_types = array['image/jpeg','image/png','image/webp'];
 
 drop policy if exists "Product images are publicly readable" on storage.objects;
 create policy "Product images are publicly readable"
   on storage.objects for select
   using (bucket_id = 'product-images');
 
+-- Path-scoped: an artisan can only write into a folder named after their own
+-- user id (the app already uploads to `${currentUser.id}/filename`). Without
+-- the foldername check, any authenticated user could upload into — or
+-- overwrite files in — any other artisan's folder.
 drop policy if exists "Authenticated users can upload product images" on storage.objects;
-create policy "Authenticated users can upload product images"
+create policy "Artisans can upload into their own folder"
   on storage.objects for insert
-  with check (bucket_id = 'product-images' and auth.role() = 'authenticated');
+  with check (
+    bucket_id = 'product-images'
+    and auth.role() = 'authenticated'
+    and (storage.foldername(name))[1] = auth.uid()::text
+  );
 
 drop policy if exists "Artisans can update their own uploaded images" on storage.objects;
 create policy "Artisans can update their own uploaded images"
   on storage.objects for update
-  using (bucket_id = 'product-images' and owner = auth.uid());
+  using (bucket_id = 'product-images' and (storage.foldername(name))[1] = auth.uid()::text);
 
 drop policy if exists "Artisans can delete their own uploaded images" on storage.objects;
 create policy "Artisans can delete their own uploaded images"
   on storage.objects for delete
-  using (bucket_id = 'product-images' and owner = auth.uid());
+  using (bucket_id = 'product-images' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ---------- AI USAGE (rate limiting for /api/caption) ----------
+-- One row per Gemini call. api/caption.js checks how many rows a user has
+-- created in the last hour before allowing another call, and inserts a new
+-- row when it proceeds. Using a real table (rather than in-memory counters)
+-- is required here because serverless functions don't persist state between
+-- invocations — a variable in the function file resets on every cold start.
+create table if not exists public.ai_usage (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists ai_usage_user_id_created_at_idx
+  on public.ai_usage(user_id, created_at);
+
+alter table public.ai_usage enable row level security;
+
+drop policy if exists "Users can insert their own usage records" on public.ai_usage;
+create policy "Users can insert their own usage records"
+  on public.ai_usage for insert
+  with check (auth.uid() = user_id);
+
+drop policy if exists "Users can read their own usage records" on public.ai_usage;
+create policy "Users can read their own usage records"
+  on public.ai_usage for select
+  using (auth.uid() = user_id);
+
+grant select, insert on public.ai_usage to authenticated;
