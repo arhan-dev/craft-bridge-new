@@ -829,7 +829,7 @@ footer{
   <div class="wrap">
     <div class="section-head reveal">
       <div><span class="eyebrow">Our Mission</span><h2>How Market Linkage works</h2></div>
-      <span class="sub">Built around MoSJE's goals for artisan welfare — fair pricing, direct access, dignity of the maker.</span>
+      <span class="sub">Built on fair pricing, direct access, and dignity for the maker.</span>
     </div>
     <div class="linkage-grid">
       <div class="linkage-card reveal"><div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="var(--rust)" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12h8M4 8v8a2 2 0 002 2h2M20 8v8a2 2 0 01-2 2h-2M8 8V6a2 2 0 012-2h4a2 2 0 012 2v2"/></svg></div><h4>Direct Market Access</h4><p>Artisans list and sell without intermediaries, reaching buyers across India from their own workshop.</p></div>
@@ -1553,7 +1553,22 @@ fileInput.addEventListener('change', e => {
 const AI_STEPS = ['CraftBridge AI is analyzing your craft…','Identifying materials…','Writing listing copy…','Tagging categories…'];
 
 function handleFile(file){
-  if(!file.type.startsWith('image/')) return;
+  // Matches the bucket's server-side allowed_mime_types / file_size_limit
+  // (see supabase/schema.sql) — checked here too so the artisan gets an
+  // immediate, friendly message instead of a failed upload later. The
+  // server-side limit is what actually protects storage; this is UX only.
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+  const MAX_BYTES = 8 * 1024 * 1024;
+  if(!ALLOWED_TYPES.includes(file.type)){
+    aiError.textContent = 'Please upload a JPG, PNG, or WEBP image.';
+    aiError.classList.add('active');
+    return;
+  }
+  if(file.size > MAX_BYTES){
+    aiError.textContent = 'Image is too large — please use a file under 8MB.';
+    aiError.classList.add('active');
+    return;
+  }
   listingPhotoFile = file;
   // A fresh photo supersedes any pre-existing image_url from an edit-in-progress.
   existingImageUrl = null;
