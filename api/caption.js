@@ -35,6 +35,7 @@ export default async function handler(req, res) {
     });
   }
 
+  let userId;
   try {
     const userRes = await fetch(`${supabaseUrl}/auth/v1/user`, {
       headers: {
@@ -47,10 +48,68 @@ export default async function handler(req, res) {
         error: "Your session has expired. Please sign in again."
       });
     }
+    const userData = await userRes.json();
+    userId = userData.id;
   } catch (err) {
     return res.status(401).json({
       error: "Could not verify your session. Please sign in again."
     });
+  }
+
+  // Rate limit: cap each artisan to RATE_LIMIT Gemini calls per hour.
+  // Auth alone stops anonymous abuse, but a signed-in user could still loop
+  // this endpoint indefinitely — each call costs real Gemini quota. This
+  // check and the insert below both run as the calling user (via their own
+  // token, not a service-role key), so Postgres RLS on ai_usage enforces
+  // that nobody can read or write another artisan's usage rows.
+  const RATE_LIMIT = 15;
+  const WINDOW_MS = 60 * 60 * 1000; // 1 hour
+  const windowStart = new Date(Date.now() - WINDOW_MS).toISOString();
+
+  try {
+    const usageRes = await fetch(
+      `${supabaseUrl}/rest/v1/ai_usage?select=id&user_id=eq.${userId}&created_at=gte.${windowStart}`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          apikey: supabaseAnonKey
+        }
+      }
+    );
+    if (usageRes.ok) {
+      const rows = await usageRes.json();
+      if (Array.isArray(rows) && rows.length >= RATE_LIMIT) {
+        return res.status(429).json({
+          error: `You've reached the limit of ${RATE_LIMIT} AI listings per hour. Please try again later, or fill in the listing details manually.`
+        });
+      }
+    }
+    // If the usage check itself fails (e.g. table missing before a migration
+    // is applied), fail open rather than blocking legitimate listings —
+    // but still record this call below so the table starts filling in.
+  } catch (err) {
+    // Same fail-open reasoning as above.
+  }
+
+  // Record this call before contacting Gemini, so a burst of concurrent
+  // requests can't all sneak in under the same stale count. Awaited (not
+  // fire-and-forget) because a serverless function can be frozen/torn down
+  // as soon as it looks idle — an un-awaited write here isn't guaranteed
+  // to finish.
+  try {
+    await fetch(`${supabaseUrl}/rest/v1/ai_usage`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        apikey: supabaseAnonKey,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+      },
+      body: JSON.stringify({ user_id: userId })
+    });
+  } catch (err) {
+    // Non-fatal: if this write fails, the worst case is the rate limit
+    // undercounts slightly. Never block the artisan's request over it.
   }
 
   try {
