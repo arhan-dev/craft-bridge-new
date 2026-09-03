@@ -1577,12 +1577,75 @@ function handleFile(file){
     listingPhotoDataUrl = e.target.result;
     uploadPreviewImg.src = listingPhotoDataUrl;
     uploadPreview.style.display = 'block';
-    runAIAnalysis(listingPhotoDataUrl);
+    // Pass the original File (not the full-res data URL) — runAIAnalysis
+    // compresses its own copy for the AI request. listingPhotoFile/
+    // listingPhotoDataUrl stay untouched for the Supabase Storage upload,
+    // which has its own separate 8MB limit enforced by the bucket itself.
+    runAIAnalysis(file);
   };
   reader.readAsDataURL(file);
 }
 
-async function runAIAnalysis(dataUrl){
+// Target for the AI request specifically — separate from, and much
+// smaller than, the Supabase Storage upload limit. Vercel Serverless
+// Functions cap request bodies well under what a typical phone photo's
+// Base64 encoding (~33% larger than the original) would produce, which is
+// exactly what caused large AI photos to fail. Resizing/compressing in the
+// browser before the request keeps the payload safely under that ceiling
+// without needing any new dependency.
+const AI_MAX_ORIGINAL_BYTES = 3 * 1024 * 1024; // ~3MB, matches api/caption.js's defense-in-depth check
+const AI_MAX_DIMENSION = 1600; // px on the long edge — plenty of detail for captioning
+
+// Resize/compress a File into a base64 JPEG sized for the AI endpoint,
+// using only built-in browser APIs (canvas), so no extra library is added.
+function compressImageForAI(file){
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      let { width, height } = img;
+      if (width > AI_MAX_DIMENSION || height > AI_MAX_DIMENSION) {
+        if (width >= height) {
+          height = Math.round(height * (AI_MAX_DIMENSION / width));
+          width = AI_MAX_DIMENSION;
+        } else {
+          width = Math.round(width * (AI_MAX_DIMENSION / height));
+          height = AI_MAX_DIMENSION;
+        }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+
+      // Step quality down until the encoded image fits comfortably under
+      // the size ceiling, or we hit a quality floor where we give up
+      // rather than degrade the photo further.
+      let quality = 0.85;
+      const tryEncode = () => {
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const approxBytes = Math.ceil((dataUrl.length - dataUrl.indexOf(',') - 1) * 3 / 4);
+        if (approxBytes <= AI_MAX_ORIGINAL_BYTES) {
+          resolve(dataUrl);
+        } else if (quality > 0.5) {
+          quality -= 0.1;
+          tryEncode();
+        } else {
+          reject(new Error('This photo is too large or detailed to compress enough for AI analysis. Please try a smaller photo, or fill in the listing manually.'));
+        }
+      };
+      tryEncode();
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Could not read this photo for AI analysis. Please try a different photo.'));
+    };
+    img.src = objectUrl;
+  });
+}
+
+async function runAIAnalysis(file){
   setActiveStep(2);
   aiIdle.style.display = 'none';
   aiError.classList.remove('active');
@@ -1596,8 +1659,9 @@ async function runAIAnalysis(dataUrl){
   }, 1100);
 
   try{
-    const base64 = dataUrl.split(',')[1];
-    const mimeType = dataUrl.substring(5, dataUrl.indexOf(';'));
+    const compressedDataUrl = await compressImageForAI(file);
+    const base64 = compressedDataUrl.split(',')[1];
+    const mimeType = compressedDataUrl.substring(5, compressedDataUrl.indexOf(';'));
 
     // AI Product Listing requires a signed-in artisan. This isn't just a
     // permissions nicety — /api/caption calls the paid Gemini API, and an
